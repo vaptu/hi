@@ -631,7 +631,7 @@ static ngx_http_variable_t  ngx_http_fastcgi_vars[] = {
       ngx_http_fastcgi_path_info_variable, 0,
       NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_NOHASH, 0 },
 
-    { ngx_null_string, NULL, NULL, 0, 0, 0 }
+      ngx_http_null_variable
 };
 
 
@@ -2646,6 +2646,7 @@ ngx_http_fastcgi_process_record(ngx_http_request_t *r,
         }
     }
 
+    f->pos = p;
     f->state = state;
 
     return NGX_AGAIN;

@@ -200,7 +200,7 @@ typedef struct {
     ngx_table_elt_t                  *expect;
     ngx_table_elt_t                  *upgrade;
 
-#if (NGX_HTTP_GZIP)
+#if (NGX_HTTP_GZIP || NGX_HTTP_HEADERS)
     ngx_table_elt_t                  *accept_encoding;
     ngx_table_elt_t                  *via;
 #endif
@@ -252,6 +252,7 @@ typedef struct {
 
 typedef struct {
     ngx_list_t                        headers;
+    ngx_list_t                        trailers;
 
     ngx_uint_t                        status;
     ngx_str_t                         status_line;
@@ -278,6 +279,7 @@ typedef struct {
     ngx_uint_t                        content_type_hash;
 
     ngx_array_t                       cache_control;
+    ngx_array_t                       link;
 
     off_t                             content_length_n;
     off_t                             content_offset;
@@ -514,6 +516,7 @@ struct ngx_http_request_s {
     unsigned                          pipeline:1;
     unsigned                          chunked:1;
     unsigned                          header_only:1;
+    unsigned                          expect_trailers:1;
     unsigned                          keepalive:1;
     unsigned                          lingering_close:1;
     unsigned                          discard_body:1;
@@ -535,6 +538,7 @@ struct ngx_http_request_s {
     unsigned                          main_filter_need_in_memory:1;
     unsigned                          filter_need_in_memory:1;
     unsigned                          filter_need_temporary:1;
+    unsigned                          preserve_body:1;
     unsigned                          allow_ranges:1;
     unsigned                          subrequest_ranges:1;
     unsigned                          single_range:1;

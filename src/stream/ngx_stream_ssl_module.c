@@ -249,6 +249,10 @@ static ngx_stream_variable_t  ngx_stream_ssl_vars[] = {
       (uintptr_t) ngx_ssl_get_raw_certificate,
       NGX_STREAM_VAR_CHANGEABLE, 0 },
 
+    { ngx_string("ssl_client_escaped_cert"), NULL, ngx_stream_ssl_variable,
+      (uintptr_t) ngx_ssl_get_escaped_certificate,
+      NGX_STREAM_VAR_CHANGEABLE, 0 },
+
     { ngx_string("ssl_client_s_dn"), NULL, ngx_stream_ssl_variable,
       (uintptr_t) ngx_ssl_get_subject_dn, NGX_STREAM_VAR_CHANGEABLE, 0 },
 
@@ -273,7 +277,7 @@ static ngx_stream_variable_t  ngx_stream_ssl_vars[] = {
     { ngx_string("ssl_client_v_remain"), NULL, ngx_stream_ssl_variable,
       (uintptr_t) ngx_ssl_get_client_v_remain, NGX_STREAM_VAR_CHANGEABLE, 0 },
 
-    { ngx_null_string, NULL, NULL, 0, 0, 0 }
+      ngx_stream_null_variable
 };
 
 
@@ -324,7 +328,7 @@ ngx_stream_ssl_handler(ngx_stream_session_t *s)
                           "client SSL certificate verify error: (%l:%s)",
                           rc, X509_verify_cert_error_string(rc));
 
-            ngx_ssl_remove_cached_session(sslcf->ssl.ctx,
+            ngx_ssl_remove_cached_session(c->ssl->session_ctx,
                                        (SSL_get0_session(c->ssl->connection)));
             return NGX_ERROR;
         }
@@ -336,7 +340,7 @@ ngx_stream_ssl_handler(ngx_stream_session_t *s)
                 ngx_log_error(NGX_LOG_INFO, c->log, 0,
                               "client sent no required SSL certificate");
 
-                ngx_ssl_remove_cached_session(sslcf->ssl.ctx,
+                ngx_ssl_remove_cached_session(c->ssl->session_ctx,
                                        (SSL_get0_session(c->ssl->connection)));
                 return NGX_ERROR;
             }

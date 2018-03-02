@@ -2,8 +2,10 @@ if test -n "$1";then
     if test "$1" = "--help" || test "$1" = "-h" ;then
         echo \$1:project name.
         echo -e "\tdefault:demo"
-        echo \$2:hi\(nginx\) install directory.
-        echo -e "\tdefault:/home/centos7/nginx"
+        echo \$2:type:cpp,python,lua ,php or java
+        echo -e "\tdefault:cpp"
+        echo \$3:hi\(nginx\) install directory.
+        echo -e "\tdefault:/usr/local/nginx"
         exit
     fi
 fi
@@ -16,22 +18,33 @@ else
     PROJECT=demo
 fi
 
-if test -n "$2";then 
-    NGINX_INSTALL_DIR=$2
+if test -n "$2";then
+    TYPE=$2
 else
-    NGINX_INSTALL_DIR=/home/centos7/nginx
+    TYPE=cpp
+fi
+
+if test -n "$3";then 
+    NGINX_INSTALL_DIR=$3
+else
+    NGINX_INSTALL_DIR=/usr/local/nginx
 fi
 
 echo "create hi project $PROJECT Makefile."
 
 mkdir -pv $PROJECT
 
+cpp_makefile_tpl(){
+
 cat << END                                                     > $PROJECT/Makefile
 
 PROJECT=$PROJECT.so
 SRC=\$(wildcard *.cpp)
 OBJ=\$(patsubst %.cpp,%.o,\$(SRC))
-NGINX_INSTALL_DIR=$NGINX_INSTALL_DIR
+
+ifndef NGINX_INSTALL_DIR
+NGINX_INSTALL_DIR=/usr/local/nginx
+endif
 
 CXX=g++ 
 CXXFLAGS+=-O3 -std=c++11 -fPIC -Wall -I\$(NGINX_INSTALL_DIR)/include
@@ -47,6 +60,7 @@ clean:
 	rm -f  \$(OBJ) \$(PROJECT)
 
 install:
+	test -d \$(NGINX_INSTALL_DIR)/hi || mkdir -p \$(NGINX_INSTALL_DIR)/hi
 	install \$(PROJECT) \$(NGINX_INSTALL_DIR)/hi
 
 END
@@ -82,5 +96,215 @@ extern "C" void destroy(hi::servlet* p) {
 }
 
 END
+}
+
+python_makefile_tpl(){
+
+cat << END                                                     > $PROJECT/Makefile
+
+SRC=\$(wildcard *.py)
+
+ifndef NGINX_INSTALL_DIR
+NGINX_INSTALL_DIR=/usr/local/nginx
+endif
+
+all:
+	@echo 'ok'
+
+clean:
+	@echo 'ok'
+
+install:
+	test -d \$(NGINX_INSTALL_DIR)/python || mkdir -p \$(NGINX_INSTALL_DIR)/pyhton
+	install \$(SRC) \$(NGINX_INSTALL_DIR)/python
+
+END
+
+echo "create hi project $PROJECT demo source file."
+
+cat << END                                                     > $PROJECT/$PROJECT.py
+
+hi_res.status(200)
+hi_res.content('hello,python')
 
 
+END
+}
+
+lua_makefile_tpl(){
+
+cat << END                                                     > $PROJECT/Makefile
+
+SRC=\$(wildcard *.lua)
+
+ifndef NGINX_INSTALL_DIR
+NGINX_INSTALL_DIR=/usr/local/nginx
+endif
+
+
+all:
+	@echo 'ok'
+
+clean:
+	@echo 'ok'
+
+install:
+	test -d \$(NGINX_INSTALL_DIR)/lua || mkdir -p \$(NGINX_INSTALL_DIR)/lua
+	install \$(SRC) \$(NGINX_INSTALL_DIR)/lua
+
+END
+
+echo "create hi project $PROJECT demo source file."
+
+cat << END                                                     > $PROJECT/$PROJECT.lua
+
+hi_res:status(200)
+hi_res:content('hello,lua')
+
+
+END
+
+}
+
+java_makefile_tpl(){
+
+cat << END                                                     > $PROJECT/Makefile
+
+SRC=\$(shell echo \`find . -type f | egrep *.java\$\$\`)
+OBJ=\$(patsubst %.java,%.class,\$(SRC))
+
+ifndef NGINX_INSTALL_DIR
+NGINX_INSTALL_DIR=/usr/local/nginx
+endif
+
+JFLAGS = -classpath .:\${NGINX_INSTALL_DIR}/java/hi-nginx-java.jar
+JC = \${JAVA_HOME}/bin/javac
+
+%.class:%.java
+	\$(JC) \$(JFLAGS) \$^
+
+
+default: classes
+
+
+classes:\$(OBJ)
+
+clean:
+	rm -f \${OBJ}
+
+install:\${OBJ}
+	for i in \${OBJ};do test -d \$(NGINX_INSTALL_DIR)/java/`dirname \$\$i` || mkdir -p \$(NGINX_INSTALL_DIR)/java/`dirname \$\$i` && install \$\$i \$(NGINX_INSTALL_DIR)/java/\$\$i ;done
+
+
+
+END
+
+echo "create hi project $PROJECT demo source file."
+mkdir -p $PROJECT/hi
+
+cat << END                                                     > $PROJECT/hi/$PROJECT.java
+
+package hi;
+
+public class $PROJECT implements hi.servlet {
+
+    public $PROJECT() {
+
+    }
+
+    public void handler(hi.request req, hi.response res) {
+        res.status = 200;
+        res.content = "hello,world";
+    }
+}
+
+
+END
+
+
+
+}
+
+php_makefile_tpl(){
+
+cat << END                                                     > $PROJECT/Makefile
+
+SRC=\$(wildcard *.php)
+
+ifndef NGINX_INSTALL_DIR
+NGINX_INSTALL_DIR=/usr/local/nginx
+endif
+
+
+all:
+	@echo 'ok'
+
+clean:
+	@echo 'ok'
+
+install:
+	test -d \$(NGINX_INSTALL_DIR)/php || mkdir -p \$(NGINX_INSTALL_DIR)/php
+	install \$(SRC) \$(NGINX_INSTALL_DIR)/php
+
+END
+
+echo "create hi project $PROJECT demo source file."
+
+cat << END                                                     > $PROJECT/$PROJECT.php
+
+<?php
+
+require_once 'hi/servlet.php';
+
+class hello implements \hi\servlet {
+
+    public function handler(\hi\request &\$req, \hi\response &\$res) {
+        \$res->content = 'hello,world';
+        \$res->status = 200;
+    }
+
+}
+
+
+
+END
+
+}
+
+
+pre_makefile_tpl(){
+
+cat << END                                                     > Makefile
+
+export NGINX_INSTALL_DIR=/usr/local/nginx
+PROJECT=\$(shell find . -maxdepth 1 -type d  |grep '^\./[^.]')
+
+all:\$(PROJECT)
+	for i in \$(PROJECT);do if test -f \$\$i/Makefile; then cd \$\$i && make && cd ..;  fi; done
+
+clean:
+	for i in \$(PROJECT);do if test -f \$\$i/Makefile; then cd \$\$i && make clean && cd ..;  fi; done
+
+install:
+	for i in \$(PROJECT);do if test -f \$\$i/Makefile; then cd \$\$i && make install && cd ..;  fi; done
+
+
+END
+
+}
+
+
+
+case $TYPE in
+    cpp) cpp_makefile_tpl;;
+    python) python_makefile_tpl;;
+    lua) lua_makefile_tpl;;
+    java) java_makefile_tpl;;
+    php) php_makefile_tpl;;
+    *) echo 'Please set TYPE in (cpp,python,lua,php or java)';;
+esac
+
+if ! test -f Makefile ;
+then
+    pre_makefile_tpl
+fi

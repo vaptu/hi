@@ -5,53 +5,97 @@ extern "C" {
 #include <ngx_md5.h>
 }
 
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#include <openssl/bio.h>
+#include <openssl/md5.h>
+#include <openssl/x509v3.h>
+
 #include <vector>
 #include <memory>
-#include <exception>
 #include "include/request.hpp"
 #include "include/response.hpp"
-#include "include/redis.hpp"
 #include "include/servlet.hpp"
+
+
 
 #include "lib/module_class.hpp"
 #include "lib/lrucache.hpp"
 #include "lib/param.hpp"
+#include "lib/redis.hpp"
+
+
 
 #include "lib/py_request.hpp"
 #include "lib/py_response.hpp"
 #include "lib/boost_py.hpp"
 
+#include "lib/php-x/phpx.h"
+#include "lib/php-x/phpx_embed.h"
+#include "lib/fmt/format.h"
+
+#include "lib/lua.hpp"
+
+#include "lib/java.hpp"
+
+
+#include "lib/MPFDParser-1.1.1/Parser.h"
+
+
 
 #define SESSION_ID_NAME "SESSIONID"
 #define form_urlencoded_type "application/x-www-form-urlencoded"
 #define form_urlencoded_type_len (sizeof(form_urlencoded_type) - 1)
+#define TEMP_DIRECTORY "temp"
 
 struct cache_ele_t {
     int status = 200;
     time_t t;
-    std::string header, content;
+    std::string content_type, content;
 };
 
 static std::vector<std::shared_ptr<hi::module_class<hi::servlet>>> PLUGIN;
-static std::vector<std::shared_ptr<cache::lru_cache<std::string, cache_ele_t>>> CACHE;
+static std::vector<std::shared_ptr<hi::cache::lru_cache<std::string, cache_ele_t>>> CACHE;
 static std::shared_ptr<hi::redis> REDIS;
 static std::shared_ptr<hi::boost_py> PYTHON;
+static std::shared_ptr<hi::lua> LUA;
+static std::shared_ptr<hi::java> JAVA;
+static std::shared_ptr<hi::cache::lru_cache<std::string, hi::java_servlet_t>> JAVA_SERVLET_CACHE;
+static bool JAVA_IS_READY = false;
+static std::shared_ptr<php::VM> PHP;
+
+enum application_t {
+    __cpp__, __python__, __lua__, __java__, __php__, __unkown__
+};
 
 typedef struct {
-    ngx_str_t module_path;
-    ngx_str_t redis_host;
-    ngx_str_t python_script;
-    ngx_str_t python_content;
-    ngx_int_t redis_port;
-    ngx_int_t module_index;
-    ngx_int_t cache_expires;
-    ngx_int_t session_expires;
-    ngx_int_t cache_index;
-    size_t cache_size;
-    ngx_flag_t need_headers;
-    ngx_flag_t need_cache;
-    ngx_flag_t need_cookies;
-    ngx_flag_t need_session;
+    ngx_str_t module_path
+    , redis_host
+    , python_script
+    , python_content
+    , lua_script
+    , lua_content
+    , java_classpath
+    , java_options
+    , java_servlet
+    , php_script;
+    ngx_int_t redis_port
+    , module_index
+    , cache_expires
+    , session_expires
+    , cache_index
+    , java_servlet_cache_expires
+    , java_version;
+    size_t cache_size
+    , java_servlet_cache_size;
+    ngx_flag_t need_headers
+    , need_cache
+    , need_cookies
+    , need_session;
+    application_t app_type;
 } ngx_http_hi_loc_conf_t;
 
 
@@ -70,6 +114,20 @@ static void get_input_headers(ngx_http_request_t* r, std::unordered_map<std::str
 static void set_output_headers(ngx_http_request_t* r, std::unordered_multimap<std::string, std::string>& output_headers);
 static ngx_str_t get_input_body(ngx_http_request_t *r);
 
+static void ngx_http_hi_cpp_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res);
+static void ngx_http_hi_python_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res);
+static void ngx_http_hi_lua_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res);
+static void ngx_http_hi_java_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res);
+
+static void java_input_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res, jobject request_instance, jobject response_instance);
+static void java_output_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res, jobject request_instance, jobject response_instance);
+static bool java_init_handler(ngx_http_hi_loc_conf_t * conf);
+
+static void ngx_http_hi_php_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res);
+
+static std::string md5(const std::string& str);
+static std::string random_string(const std::string& s);
+static bool is_dir(const std::string& s);
 
 ngx_command_t ngx_http_hi_commands[] = {
     {
@@ -82,7 +140,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_cache_size"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_num_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, cache_size),
@@ -90,7 +148,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_cache_expires"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_sec_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, cache_expires),
@@ -98,7 +156,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_need_headers"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_flag_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, need_headers),
@@ -106,7 +164,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_need_cache"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_flag_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, need_cache),
@@ -114,7 +172,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_need_cookies"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_flag_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, need_cookies),
@@ -122,7 +180,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_redis_host"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_str_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, redis_host),
@@ -130,7 +188,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_redis_port"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_num_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, redis_port),
@@ -138,7 +196,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_need_session"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_flag_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, need_session),
@@ -146,7 +204,7 @@ ngx_command_t ngx_http_hi_commands[] = {
     },
     {
         ngx_string("hi_session_expires"),
-        NGX_HTTP_LOC_CONF | NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
         ngx_conf_set_sec_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, session_expires),
@@ -166,6 +224,78 @@ ngx_command_t ngx_http_hi_commands[] = {
         ngx_http_hi_conf_init,
         NGX_HTTP_LOC_CONF_OFFSET,
         offsetof(ngx_http_hi_loc_conf_t, python_content),
+        NULL
+    },
+    {
+        ngx_string("hi_lua_script"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_http_hi_conf_init,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, lua_script),
+        NULL
+    },
+    {
+        ngx_string("hi_lua_content"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_http_hi_conf_init,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, lua_content),
+        NULL
+    },
+    {
+        ngx_string("hi_java_classpath"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_classpath),
+        NULL
+    },
+    {
+        ngx_string("hi_java_options"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_options),
+        NULL
+    },
+    {
+        ngx_string("hi_java_servlet"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_http_hi_conf_init,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_servlet),
+        NULL
+    },
+    {
+        ngx_string("hi_java_servlet_cache_expires"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_sec_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_servlet_cache_expires),
+        NULL
+    },
+    {
+        ngx_string("hi_java_servlet_cache_size"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_servlet_cache_size),
+        NULL
+    },
+    {
+        ngx_string("hi_java_version"),
+        NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_SIF_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, java_version),
+        NULL
+    },
+    {
+        ngx_string("hi_php_script"),
+        NGX_HTTP_LOC_CONF | NGX_HTTP_LIF_CONF | NGX_CONF_TAKE1,
+        ngx_http_hi_conf_init,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_hi_loc_conf_t, php_script),
         NULL
     },
     ngx_null_command
@@ -206,6 +336,13 @@ ngx_module_t ngx_http_hi_module = {
 static ngx_int_t clean_up(ngx_conf_t *cf) {
     PLUGIN.clear();
     CACHE.clear();
+    REDIS.reset();
+    PYTHON.reset();
+    LUA.reset();
+    JAVA.reset();
+    JAVA_SERVLET_CACHE.reset();
+    JAVA_IS_READY = false;
+    PHP.reset();
     return NGX_OK;
 }
 
@@ -229,6 +366,19 @@ static void * ngx_http_hi_create_loc_conf(ngx_conf_t *cf) {
         conf->python_script.data = NULL;
         conf->python_content.len = 0;
         conf->python_content.data = NULL;
+        conf->lua_script.len = 0;
+        conf->lua_script.data = NULL;
+        conf->lua_content.len = 0;
+        conf->lua_content.data = NULL;
+        conf->php_script.len = 0;
+        conf->php_script.data = NULL;
+        conf->java_classpath.len = 0;
+        conf->java_classpath.data = NULL;
+        conf->java_servlet.len = 0;
+        conf->java_servlet.data = NULL;
+        conf->java_servlet_cache_size = NGX_CONF_UNSET_UINT;
+        conf->java_servlet_cache_expires = NGX_CONF_UNSET;
+        conf->java_version = NGX_CONF_UNSET;
         conf->redis_port = NGX_CONF_UNSET;
         conf->cache_size = NGX_CONF_UNSET_UINT;
         conf->cache_expires = NGX_CONF_UNSET;
@@ -238,6 +388,7 @@ static void * ngx_http_hi_create_loc_conf(ngx_conf_t *cf) {
         conf->need_cache = NGX_CONF_UNSET;
         conf->need_cookies = NGX_CONF_UNSET;
         conf->need_session = NGX_CONF_UNSET;
+        conf->app_type = application_t::__unkown__;
         return conf;
     }
     return NGX_CONF_ERROR;
@@ -251,6 +402,15 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
     ngx_conf_merge_str_value(conf->redis_host, prev->redis_host, "");
     ngx_conf_merge_str_value(conf->python_script, prev->python_script, "");
     ngx_conf_merge_str_value(conf->python_content, prev->python_content, "");
+    ngx_conf_merge_str_value(conf->lua_script, prev->lua_script, "");
+    ngx_conf_merge_str_value(conf->lua_content, prev->lua_content, "");
+    ngx_conf_merge_str_value(conf->php_script, prev->php_script, "");
+    ngx_conf_merge_str_value(conf->java_classpath, prev->java_classpath, "-Djava.class.path=.");
+    ngx_conf_merge_str_value(conf->java_options, prev->java_options, "-server -d64 -Xmx1G -Xms1G -Xmn256m");
+    ngx_conf_merge_str_value(conf->java_servlet, prev->java_servlet, "");
+    ngx_conf_merge_uint_value(conf->java_servlet_cache_size, prev->java_servlet_cache_size, (size_t) 10);
+    ngx_conf_merge_sec_value(conf->java_servlet_cache_expires, prev->java_servlet_cache_expires, (ngx_int_t) 300);
+    ngx_conf_merge_value(conf->java_version, prev->java_version, (ngx_int_t) 8);
     ngx_conf_merge_value(conf->redis_port, prev->redis_port, (ngx_int_t) 0);
     ngx_conf_merge_uint_value(conf->cache_size, prev->cache_size, (size_t) 10);
     ngx_conf_merge_sec_value(conf->cache_expires, prev->cache_expires, (ngx_int_t) 300);
@@ -259,17 +419,16 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
     ngx_conf_merge_value(conf->need_cache, prev->need_cache, (ngx_flag_t) 1);
     ngx_conf_merge_value(conf->need_cookies, prev->need_cookies, (ngx_flag_t) 0);
     ngx_conf_merge_value(conf->need_session, prev->need_session, (ngx_flag_t) 0);
+    if (conf->need_session == 1 && conf->need_cookies == 0) {
+        conf->need_cookies = 1;
+    }
     if (conf->module_index == NGX_CONF_UNSET && conf->module_path.len > 0) {
-        std::string tmp((char*) conf->module_path.data, conf->module_path.len);
-        if (tmp.front() != '/') {
-            tmp.insert(0, NGX_PREFIX);
-        }
 
         ngx_int_t index = NGX_CONF_UNSET;
         bool found = false;
         for (auto& item : PLUGIN) {
             ++index;
-            if (item->get_module() == tmp) {
+            if (item->get_module() == (char*) conf->module_path.data) {
                 found = true;
                 break;
             }
@@ -277,13 +436,35 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
         if (found) {
             conf->module_index = index;
         } else {
-            PLUGIN.push_back(std::make_shared<hi::module_class < hi::servlet >> (tmp));
+            PLUGIN.push_back(std::make_shared<hi::module_class < hi::servlet >> ((char*) conf->module_path.data));
             conf->module_index = PLUGIN.size() - 1;
+        }
+        conf->app_type = application_t::__cpp__;
+    }
+
+    if (conf->python_content.len > 0 || conf->python_script.len > 0) {
+        conf->app_type = application_t::__python__;
+    }
+    if (conf->lua_content.len > 0 || conf->lua_script.len > 0) {
+        conf->app_type = application_t::__lua__;
+    }
+    if (conf->php_script.len > 0) {
+        conf->app_type = application_t::__php__;
+        if (!PHP) {
+            int argc = 1;
+            char* argv[2] = {"", NULL};
+            PHP = std::move(std::make_shared<php::VM>(argc, argv));
+        }
+    }
+    if (conf->java_servlet.len > 0) {
+        conf->app_type = application_t::__java__;
+        if (!JAVA_SERVLET_CACHE) {
+            JAVA_SERVLET_CACHE = std::make_shared<hi::cache::lru_cache < std::string, hi::java_servlet_t >> (conf->java_servlet_cache_size);
         }
     }
 
     if (conf->need_cache == 1 && conf->cache_index == NGX_CONF_UNSET) {
-        CACHE.push_back(std::make_shared<cache::lru_cache < std::string, cache_ele_t >> (conf->cache_size));
+        CACHE.push_back(std::make_shared<hi::cache::lru_cache < std::string, cache_ele_t >> (conf->cache_size));
         conf->cache_index = CACHE.size() - 1;
     }
 
@@ -293,10 +474,9 @@ static char * ngx_http_hi_merge_loc_conf(ngx_conf_t* cf, void* parent, void* chi
 
 static ngx_int_t ngx_http_hi_handler(ngx_http_request_t *r) {
     if (r->headers_in.content_length_n > 0) {
-        if (r->headers_in.content_type->value.len < form_urlencoded_type_len
-                || ngx_strncasecmp(r->headers_in.content_type->value.data, (u_char *) form_urlencoded_type,
-                form_urlencoded_type_len) != 0) {
-            return NGX_DECLINED;
+        ngx_http_core_loc_conf_t *clcf = (ngx_http_core_loc_conf_t *) ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+        if (clcf->client_body_buffer_size < (size_t) clcf->client_max_body_size) {
+            clcf->client_body_buffer_size = clcf->client_max_body_size;
         }
         r->request_body_in_single_buf = 1;
         r->request_body_file_log_level = 0;
@@ -314,12 +494,11 @@ static ngx_int_t ngx_http_hi_handler(ngx_http_request_t *r) {
 static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
 
     ngx_http_hi_loc_conf_t * conf = (ngx_http_hi_loc_conf_t *) ngx_http_get_module_loc_conf(r, ngx_http_hi_module);
-    std::shared_ptr<hi::servlet> view_instance;
-    if (conf->module_index != NGX_CONF_UNSET) {
-        view_instance = std::move(PLUGIN[conf->module_index]->make_obj());
-        if (!view_instance) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, std::string("Failed to allocate servlet_instance from ").append((char*) conf->module_path.data).c_str());
-            return NGX_HTTP_NOT_IMPLEMENTED;
+
+    if (r->headers_in.if_modified_since && r->headers_in.if_modified_since->value.data) {
+        time_t now = time(NULL), old = ngx_http_parse_time(r->headers_in.if_modified_since->value.data, r->headers_in.if_modified_since->value.len);
+        if (difftime(now, old) <= conf->cache_expires) {
+            return NGX_HTTP_NOT_MODIFIED;
         }
     }
 
@@ -333,6 +512,7 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
     }
     std::shared_ptr<std::string> cache_k;
     if (conf->need_cache == 1) {
+        ngx_response.headers.insert(std::make_pair("Last-Modified", (char*) ngx_cached_http_time.data));
         cache_k = std::make_shared<std::string>(ngx_request.uri);
         if (r->args.len > 0) {
             cache_k->append("?").append(ngx_request.param);
@@ -360,7 +540,7 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
                 CACHE[conf->cache_index]->erase(*cache_k);
             } else {
                 ngx_response.content = cache_v.content;
-                ngx_response.headers.find("Content-Type")->second = cache_v.header;
+                ngx_response.headers.find("Content-Type")->second = cache_v.content_type;
                 ngx_response.status = cache_v.status;
                 goto done;
             }
@@ -380,7 +560,42 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
     }
     if (r->headers_in.content_length_n > 0) {
         ngx_str_t body = get_input_body(r);
-        hi::parser_param(std::string((char*) body.data, body.len), ngx_request.form);
+        if (r->headers_in.content_type->value.len < form_urlencoded_type_len
+                || ngx_strncasecmp(r->headers_in.content_type->value.data, (u_char *) form_urlencoded_type,
+                form_urlencoded_type_len) != 0) {
+            try {
+                if ((is_dir(TEMP_DIRECTORY) || mkdir(TEMP_DIRECTORY, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == 0)) {
+                    ngx_http_core_loc_conf_t *clcf = (ngx_http_core_loc_conf_t *) ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+                    std::shared_ptr<MPFD::Parser> POSTParser(new MPFD::Parser());
+                    POSTParser->SetTempDirForFileUpload(TEMP_DIRECTORY);
+                    POSTParser->SetUploadedFilesStorage(MPFD::Parser::StoreUploadedFilesInFilesystem);
+                    POSTParser->SetMaxCollectedDataLength(clcf->client_max_body_size);
+                    POSTParser->SetContentType((char*) r->headers_in.content_type->value.data);
+                    POSTParser->AcceptSomeData((char*) body.data, body.len);
+                    auto fields = POSTParser->GetFieldsMap();
+                    for (auto &item : fields) {
+                        if (item.second->GetType() == MPFD::Field::TextType) {
+                            ngx_request.form.insert(std::make_pair(item.first, item.second->GetTextTypeContent()));
+                        } else {
+                            std::string upload_file_name = item.second->GetFileName(), ext;
+                            std::string::size_type p = upload_file_name.find_last_of(".");
+                            if (p != std::string::npos) {
+                                ext = upload_file_name.substr(p);
+                            }
+                            std::string temp_file = TEMP_DIRECTORY + ("/" + random_string(ngx_request.client + item.second->GetFileName()).append(ext));
+                            rename(item.second->GetTempFileName().c_str(), temp_file.c_str());
+                            ngx_request.form.insert(std::make_pair(item.first, temp_file));
+                        }
+                    }
+                }
+            } catch (MPFD::Exception& err) {
+                ngx_response.content = err.GetError();
+                ngx_response.status = 500;
+                goto done;
+            }
+        } else {
+            hi::parser_param(std::string((char*) body.data, body.len), ngx_request.form);
+        }
     }
     if (conf->need_cookies == 1 && r->headers_in.cookies.elts != NULL && r->headers_in.cookies.nelts != 0) {
         ngx_table_elt_t ** cookies = (ngx_table_elt_t **) r->headers_in.cookies.elts;
@@ -394,53 +609,38 @@ static ngx_int_t ngx_http_hi_normal_handler(ngx_http_request_t *r) {
         if (!REDIS) {
             REDIS = std::make_shared<hi::redis>();
         }
-        if (REDIS && !REDIS->is_connected() && conf->redis_host.len > 0 && conf->redis_port > 0) {
+        if (!REDIS->is_connected() && conf->redis_host.len > 0 && conf->redis_port > 0) {
             REDIS->connect((char*) conf->redis_host.data, (int) conf->redis_port);
         }
-        if (REDIS && REDIS->is_connected()) {
+        if (REDIS->is_connected()) {
             SESSION_ID_VALUE = ngx_request.cookies[SESSION_ID_NAME ];
             if (!REDIS->exists(SESSION_ID_VALUE)) {
                 REDIS->hset(SESSION_ID_VALUE, SESSION_ID_NAME, SESSION_ID_VALUE);
                 REDIS->expire(SESSION_ID_VALUE, conf->session_expires);
-                ngx_request.session[SESSION_ID_VALUE] = SESSION_ID_VALUE;
+                ngx_request.session[SESSION_ID_NAME] = SESSION_ID_VALUE;
             } else {
                 REDIS->hgetall(SESSION_ID_VALUE, ngx_request.session);
             }
-#ifdef USE_HIREDIS
-            if (view_instance) {
-                view_instance->REDIS = REDIS;
-            }
-#endif
         }
     }
-
-    if (conf->module_index != NGX_CONF_UNSET) {
-        view_instance->handler(ngx_request, ngx_response);
-    } else if (conf->python_script.len > 0 || conf->python_content.len > 0) {
-        hi::py_request py_req;
-        hi::py_response py_res;
-        py_req.init(&ngx_request);
-        py_res.init(&ngx_response);
-        if (!PYTHON) {
-            PYTHON = std::make_shared<hi::boost_py>();
-        }
-        if (PYTHON) {
-            PYTHON->set_req(&py_req);
-            PYTHON->set_res(&py_res);
-            if (conf->python_script.len > 0) {
-                PYTHON->call_script(std::string((char*) conf->python_script.data, conf->python_script.len).append(ngx_request.uri));
-            } else if (conf->python_content.len > 0) {
-                PYTHON->call_content((char*) conf->python_content.data);
-            }
-        } else {
-            return NGX_HTTP_NOT_IMPLEMENTED;
-        }
+    switch (conf->app_type) {
+        case application_t::__cpp__:ngx_http_hi_cpp_handler(conf, ngx_request, ngx_response);
+            break;
+        case application_t::__python__:ngx_http_hi_python_handler(conf, ngx_request, ngx_response);
+            break;
+        case application_t::__lua__:ngx_http_hi_lua_handler(conf, ngx_request, ngx_response);
+            break;
+        case application_t::__java__:ngx_http_hi_java_handler(conf, ngx_request, ngx_response);
+            break;
+        case application_t::__php__:ngx_http_hi_php_handler(conf, ngx_request, ngx_response);
+            break;
+        default:break;
     }
 
-    if (conf->need_cache == 1 && conf->cache_expires > 0) {
+    if (ngx_response.status == 200 && conf->need_cache == 1 && conf->cache_expires > 0) {
         cache_ele_t cache_v;
         cache_v.content = ngx_response.content;
-        cache_v.header = ngx_response.headers.find("Content-Type")->second;
+        cache_v.content_type = ngx_response.headers.find("Content-Type")->second;
         cache_v.status = ngx_response.status;
         cache_v.t = time(NULL);
         CACHE[conf->cache_index]->put(*cache_k, cache_v);
@@ -568,4 +768,386 @@ static ngx_str_t get_input_body(ngx_http_request_t *r) {
     body.len = len;
     body.data = data;
     return body;
+}
+
+static void ngx_http_hi_cpp_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res) {
+    std::shared_ptr<hi::servlet> view_instance = std::move(PLUGIN[conf->module_index]->make_obj());
+    if (view_instance) {
+        view_instance->handler(req, res);
+    }
+
+}
+
+static void ngx_http_hi_python_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res) {
+    hi::py_request py_req;
+    hi::py_response py_res;
+    py_req.init(&req);
+    py_res.init(&res);
+    if (!PYTHON) {
+        PYTHON = std::make_shared<hi::boost_py>();
+    }
+    if (PYTHON) {
+        PYTHON->set_req(&py_req);
+        PYTHON->set_res(&py_res);
+        if (conf->python_script.len > 0) {
+            PYTHON->call_script(std::string((char*) conf->python_script.data, conf->python_script.len).append(req.uri));
+        } else if (conf->python_content.len > 0) {
+            PYTHON->call_content((char*) conf->python_content.data);
+        }
+    }
+}
+
+static void ngx_http_hi_lua_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res) {
+    hi::py_request py_req;
+    hi::py_response py_res;
+    py_req.init(&req);
+    py_res.init(&res);
+    if (!LUA) {
+        LUA = std::make_shared<hi::lua>();
+    }
+    if (LUA) {
+        LUA->set_req(&py_req);
+        LUA->set_res(&py_res);
+        if (conf->lua_script.len > 0) {
+            LUA->call_script(std::string((char*) conf->lua_script.data, conf->lua_script.len).append(req.uri));
+        } else if (conf->lua_content.len > 0) {
+            LUA->call_content((char*) conf->lua_content.data);
+        }
+    }
+}
+
+static void ngx_http_hi_java_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res) {
+    if (java_init_handler(conf)) {
+
+        jobject request_instance, response_instance;
+
+
+        request_instance = JAVA->env->NewObject(JAVA->request, JAVA->request_ctor);
+        response_instance = JAVA->env->NewObject(JAVA->response, JAVA->response_ctor);
+
+        java_input_handler(conf, req, res, request_instance, response_instance);
+
+
+
+        hi::java_servlet_t jtmp;
+        if (JAVA_SERVLET_CACHE->exists((const char*) conf->java_servlet.data)) {
+            jtmp = JAVA_SERVLET_CACHE->get((const char*) conf->java_servlet.data);
+            time_t now = time(0);
+            if (difftime(now, jtmp.t) > conf->java_servlet_cache_expires) {
+                JAVA_SERVLET_CACHE->erase((const char*) conf->java_servlet.data);
+                goto java_servlet_update;
+            }
+        } else {
+java_servlet_update:
+            jtmp.SERVLET = JAVA->env->FindClass((const char*) conf->java_servlet.data);
+            if (jtmp.SERVLET == NULL)return;
+            jtmp.CTOR = JAVA->env->GetMethodID(jtmp.SERVLET, "<init>", "()V");
+            jtmp.HANDLER = JAVA->env->GetMethodID(jtmp.SERVLET, "handler", "(Lhi/request;Lhi/response;)V");
+            jtmp.t = time(0);
+            JAVA_SERVLET_CACHE->put((const char*) conf->java_servlet.data, jtmp);
+        }
+        jobject servlet_instance = JAVA->env->NewObject(jtmp.SERVLET, jtmp.CTOR);
+        JAVA->env->CallVoidMethod(servlet_instance, jtmp.HANDLER, request_instance, response_instance);
+        JAVA->env->DeleteLocalRef(servlet_instance);
+
+
+        java_output_handler(conf, req, res, request_instance, response_instance);
+
+
+        JAVA->env->DeleteLocalRef(request_instance);
+        JAVA->env->DeleteLocalRef(response_instance);
+    }
+
+}
+
+static void java_input_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res, jobject request_instance, jobject response_instance) {
+    jstring client = JAVA->env->NewStringUTF(req.client.c_str());
+    JAVA->env->SetObjectField(request_instance, JAVA->client, client);
+    JAVA->env->ReleaseStringUTFChars(client, 0);
+    JAVA->env->DeleteLocalRef(client);
+
+    jstring user_agent = JAVA->env->NewStringUTF(req.user_agent.c_str());
+    JAVA->env->SetObjectField(request_instance, JAVA->user_agent, user_agent);
+    JAVA->env->ReleaseStringUTFChars(user_agent, 0);
+    JAVA->env->DeleteLocalRef(user_agent);
+
+    jstring method = JAVA->env->NewStringUTF(req.method.c_str());
+    JAVA->env->SetObjectField(request_instance, JAVA->method, method);
+    JAVA->env->ReleaseStringUTFChars(method, 0);
+    JAVA->env->DeleteLocalRef(method);
+
+    jstring uri = JAVA->env->NewStringUTF(req.uri.c_str());
+    JAVA->env->SetObjectField(request_instance, JAVA->uri, uri);
+    JAVA->env->ReleaseStringUTFChars(uri, 0);
+    JAVA->env->DeleteLocalRef(uri);
+
+    jstring param = JAVA->env->NewStringUTF(req.param.c_str());
+    JAVA->env->SetObjectField(request_instance, JAVA->param, param);
+    JAVA->env->ReleaseStringUTFChars(param, 0);
+    JAVA->env->DeleteLocalRef(param);
+
+    if (conf->need_headers == 1) {
+        jobject req_headers = JAVA->env->GetObjectField(request_instance, JAVA->req_headers);
+        for (auto& item : req.headers) {
+            jstring k = JAVA->env->NewStringUTF(item.first.c_str())
+                    , v = JAVA->env->NewStringUTF(item.second.c_str());
+            JAVA->env->CallObjectMethod(req_headers, JAVA->hashmap_put, k, v);
+            JAVA->env->ReleaseStringUTFChars(k, 0);
+            JAVA->env->ReleaseStringUTFChars(v, 0);
+            JAVA->env->DeleteLocalRef(k);
+            JAVA->env->DeleteLocalRef(v);
+        }
+        JAVA->env->DeleteLocalRef(req_headers);
+    }
+
+    jobject req_form = JAVA->env->GetObjectField(request_instance, JAVA->form);
+    for (auto& item : req.form) {
+        jstring k = JAVA->env->NewStringUTF(item.first.c_str())
+                , v = JAVA->env->NewStringUTF(item.second.c_str());
+        JAVA->env->CallObjectMethod(req_form, JAVA->hashmap_put, k, v);
+        JAVA->env->ReleaseStringUTFChars(k, 0);
+        JAVA->env->ReleaseStringUTFChars(v, 0);
+        JAVA->env->DeleteLocalRef(k);
+        JAVA->env->DeleteLocalRef(v);
+    }
+    JAVA->env->DeleteLocalRef(req_form);
+
+    if (conf->need_cookies == 1) {
+        jobject req_cookies = JAVA->env->GetObjectField(request_instance, JAVA->cookies);
+        for (auto& item : req.cookies) {
+            jstring k = JAVA->env->NewStringUTF(item.first.c_str())
+                    , v = JAVA->env->NewStringUTF(item.second.c_str());
+            JAVA->env->CallObjectMethod(req_cookies, JAVA->hashmap_put, k, v);
+            JAVA->env->ReleaseStringUTFChars(k, 0);
+            JAVA->env->ReleaseStringUTFChars(v, 0);
+            JAVA->env->DeleteLocalRef(k);
+            JAVA->env->DeleteLocalRef(v);
+        }
+        JAVA->env->DeleteLocalRef(req_cookies);
+    }
+
+    if (conf->need_session == 1) {
+        jobject req_session = JAVA->env->GetObjectField(request_instance, JAVA->req_session);
+        for (auto& item : req.session) {
+            jstring k = JAVA->env->NewStringUTF(item.first.c_str())
+                    , v = JAVA->env->NewStringUTF(item.second.c_str());
+            JAVA->env->CallObjectMethod(req_session, JAVA->hashmap_put, k, v);
+            JAVA->env->ReleaseStringUTFChars(k, 0);
+            JAVA->env->ReleaseStringUTFChars(v, 0);
+            JAVA->env->DeleteLocalRef(k);
+            JAVA->env->DeleteLocalRef(v);
+        }
+        JAVA->env->DeleteLocalRef(req_session);
+    }
+
+}
+
+static void java_output_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res, jobject request_instance, jobject response_instance) {
+    jobject res_headers = JAVA->env->GetObjectField(response_instance, JAVA->res_headers);
+    jobject keyset = JAVA->env->CallObjectMethod(res_headers, JAVA->hashmap_keyset);
+    jobject iterator = JAVA->env->CallObjectMethod(keyset, JAVA->set_iterator);
+    while ((bool)JAVA->env->CallBooleanMethod(iterator, JAVA->hasnext)) {
+        jstring k = (jstring) JAVA->env->CallObjectMethod(iterator, JAVA->next);
+        jobject item = JAVA->env->CallObjectMethod(res_headers, JAVA->hashmap_get, k);
+        jobject jterator = JAVA->env->CallObjectMethod(item, JAVA->arraylist_iterator);
+        const char * kstr = JAVA->env->GetStringUTFChars(k, NULL);
+        while ((bool)JAVA->env->CallBooleanMethod(jterator, JAVA->hasnext)) {
+            jstring v = (jstring) JAVA->env->CallObjectMethod(jterator, JAVA->next);
+            const char* vstr = JAVA->env->GetStringUTFChars(v, NULL);
+            res.headers.insert(std::make_pair(kstr, vstr));
+            JAVA->env->ReleaseStringUTFChars(v, vstr);
+            JAVA->env->DeleteLocalRef(v);
+        }
+        JAVA->env->ReleaseStringUTFChars(k, kstr);
+        JAVA->env->DeleteLocalRef(k);
+        JAVA->env->DeleteLocalRef(item);
+        JAVA->env->DeleteLocalRef(jterator);
+    }
+    JAVA->env->DeleteLocalRef(res_headers);
+    JAVA->env->DeleteLocalRef(keyset);
+    JAVA->env->DeleteLocalRef(iterator);
+
+    if (conf->need_session == 1) {
+        jobject res_session = JAVA->env->GetObjectField(response_instance, JAVA->res_session);
+        keyset = JAVA->env->CallObjectMethod(res_session, JAVA->hashmap_keyset);
+        iterator = JAVA->env->CallObjectMethod(keyset, JAVA->set_iterator);
+        while ((bool)JAVA->env->CallBooleanMethod(iterator, JAVA->hasnext)) {
+            jstring k = (jstring) JAVA->env->CallObjectMethod(iterator, JAVA->next);
+            jstring v = (jstring) JAVA->env->CallObjectMethod(res_session, JAVA->hashmap_get, k);
+            const char * kstr = JAVA->env->GetStringUTFChars(k, NULL),
+                    * vstr = JAVA->env->GetStringUTFChars(v, NULL);
+            res.session[kstr] = vstr;
+            JAVA->env->ReleaseStringUTFChars(k, kstr);
+            JAVA->env->DeleteLocalRef(k);
+            JAVA->env->ReleaseStringUTFChars(v, vstr);
+            JAVA->env->DeleteLocalRef(v);
+        }
+        JAVA->env->DeleteLocalRef(res_session);
+        JAVA->env->DeleteLocalRef(keyset);
+        JAVA->env->DeleteLocalRef(iterator);
+    }
+
+    res.status = JAVA->env->GetIntField(response_instance, JAVA->status);
+    jstring content = (jstring) JAVA->env->GetObjectField(response_instance, JAVA->content);
+    const char* contentstr = JAVA->env->GetStringUTFChars(content, NULL);
+    res.content = contentstr;
+    JAVA->env->ReleaseStringUTFChars(content, contentstr);
+    JAVA->env->DeleteLocalRef(content);
+}
+
+static bool java_init_handler(ngx_http_hi_loc_conf_t * conf) {
+    if (JAVA_IS_READY)return JAVA_IS_READY;
+    if (!JAVA) {
+        JAVA = std::make_shared<hi::java>((char*) conf->java_classpath.data, (char*) conf->java_options.data, conf->java_version);
+        if (JAVA->is_ok()) {
+            JAVA->request = JAVA->env->FindClass("hi/request");
+            if (JAVA->request != NULL) {
+                JAVA->request_ctor = JAVA->env->GetMethodID(JAVA->request, "<init>", "()V");
+                JAVA->client = JAVA->env->GetFieldID(JAVA->request, "client", "Ljava/lang/String;");
+                JAVA->user_agent = JAVA->env->GetFieldID(JAVA->request, "user_agent", "Ljava/lang/String;");
+                JAVA->method = JAVA->env->GetFieldID(JAVA->request, "method", "Ljava/lang/String;");
+                JAVA->uri = JAVA->env->GetFieldID(JAVA->request, "uri", "Ljava/lang/String;");
+                JAVA->param = JAVA->env->GetFieldID(JAVA->request, "param", "Ljava/lang/String;");
+                JAVA->req_headers = JAVA->env->GetFieldID(JAVA->request, "headers", "Ljava/util/HashMap;");
+                JAVA->form = JAVA->env->GetFieldID(JAVA->request, "form", "Ljava/util/HashMap;");
+                JAVA->cookies = JAVA->env->GetFieldID(JAVA->request, "cookies", "Ljava/util/HashMap;");
+                JAVA->req_session = JAVA->env->GetFieldID(JAVA->request, "session", "Ljava/util/HashMap;");
+
+
+                JAVA->response = JAVA->env->FindClass("hi/response");
+                if (JAVA->response != NULL) {
+                    JAVA->response_ctor = JAVA->env->GetMethodID(JAVA->response, "<init>", "()V");
+                    JAVA->status = JAVA->env->GetFieldID(JAVA->response, "status", "I");
+                    JAVA->content = JAVA->env->GetFieldID(JAVA->response, "content", "Ljava/lang/String;");
+                    JAVA->res_headers = JAVA->env->GetFieldID(JAVA->response, "headers", "Ljava/util/HashMap;");
+                    JAVA->res_session = JAVA->env->GetFieldID(JAVA->response, "session", "Ljava/util/HashMap;");
+
+                    JAVA->hashmap = JAVA->env->FindClass("java/util/HashMap");
+                    JAVA->hashmap_put = JAVA->env->GetMethodID(JAVA->hashmap, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+                    JAVA->hashmap_get = JAVA->env->GetMethodID(JAVA->hashmap, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+                    JAVA->hashmap_keyset = JAVA->env->GetMethodID(JAVA->hashmap, "keySet", "()Ljava/util/Set;");
+
+                    JAVA->arraylist = JAVA->env->FindClass("java/util/ArrayList");
+                    JAVA->arraylist_get = JAVA->env->GetMethodID(JAVA->arraylist, "get", "(I)Ljava/lang/Object;");
+                    JAVA->arraylist_size = JAVA->env->GetMethodID(JAVA->arraylist, "size", "()I");
+                    JAVA->arraylist_iterator = JAVA->env->GetMethodID(JAVA->arraylist, "iterator", "()Ljava/util/Iterator;");
+
+                    JAVA->iterator = JAVA->env->FindClass("java/util/Iterator");
+                    JAVA->hasnext = JAVA->env->GetMethodID(JAVA->iterator, "hasNext", "()Z");
+                    JAVA->next = JAVA->env->GetMethodID(JAVA->iterator, "next", "()Ljava/lang/Object;");
+
+                    JAVA->set = JAVA->env->FindClass("java/util/Set");
+                    JAVA->set_iterator = JAVA->env->GetMethodID(JAVA->set, "iterator", "()Ljava/util/Iterator;");
+                    JAVA_IS_READY = true;
+                }
+            }
+        }
+    }
+    return JAVA_IS_READY;
+}
+
+static std::string md5(const std::string& str) {
+    unsigned char digest[16] = {0};
+    MD5_CTX ctx;
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, str.c_str(), str.size());
+    MD5_Final(digest, &ctx);
+
+    unsigned char tmp[32] = {0}, *dst = &tmp[0], *src = &digest[0];
+    unsigned char hex[] = "0123456789abcdef";
+    int len = 16;
+    while (len--) {
+        *dst++ = hex[*src >> 4];
+        *dst++ = hex[*src++ & 0xf];
+    }
+
+    return std::string((char*) tmp, 32);
+}
+
+static std::string random_string(const std::string& s) {
+    time_t now = time(NULL);
+    char* now_str = ctime(&now);
+    return md5(s + now_str);
+}
+
+static bool is_dir(const std::string& s) {
+    struct stat st;
+    return stat(s.c_str(), &st) >= 0 && S_ISDIR(st.st_mode);
+}
+
+static void ngx_http_hi_php_handler(ngx_http_hi_loc_conf_t * conf, hi::request& req, hi::response& res) {
+    std::string script = std::move(std::string((char*) conf->php_script.data, conf->php_script.len).append(req.uri));
+    if (access(script.c_str(), F_OK) == 0) {
+        zend_first_try
+                {
+            PHP->include(script.c_str());
+            const char *request = "\\hi\\request", *response = "\\hi\\response", *handler = "handler";
+            php::Object php_req = php::newObject(request), php_res = php::newObject(response);
+            if (!php_req.isNull()&&!php_res.isNull()) {
+                php_req.set("client", php::Variant(req.client));
+                php_req.set("method", php::Variant(req.method));
+                php_req.set("user_agent", php::Variant(req.user_agent));
+                php_req.set("param", php::Variant(req.param));
+                php_req.set("uri", php::Variant(req.uri));
+
+                php::Array php_req_headers, php_req_form, php_req_cookies, php_req_session;
+                for (auto & i : req.headers) {
+                    php_req_headers.set(i.first.c_str(), php::Variant(i.second));
+                }
+                for (auto & i : req.form) {
+                    php_req_form.set(i.first.c_str(), php::Variant(i.second));
+                }
+                for (auto & i : req.cookies) {
+                    php_req_cookies.set(i.first.c_str(), php::Variant(i.second));
+                }
+                for (auto & i : req.session) {
+                    php_req_session.set(i.first.c_str(), php::Variant(i.second));
+                }
+                php_req.set("headers", php_req_headers);
+                php_req.set("form", php_req_form);
+                php_req.set("cookies", php_req_cookies);
+                php_req.set("session", php_req_session);
+
+
+
+
+                auto p = req.uri.find_last_of('/'), q = req.uri.find_last_of('.');
+
+                std::string class_name = std::move(req.uri.substr(p + 1, q - 1 - p));
+
+
+                php::Object servlet = php::newObject(class_name.c_str());
+
+
+                if (!servlet.isNull() && servlet.methodExists(handler)) {
+                    servlet.exec(handler, php_req, php_res);
+                    php::Array res_headers = php_res.get("headers"), res_session = php_res.get("session");
+
+
+                    for (auto i = res_headers.begin(); i != res_headers.end(); i++) {
+                        auto v = i.value();
+                        if (v.isArray()) {
+                            php::Array arr(v);
+                            for (size_t j = 0; j < arr.count(); j++) {
+                                res.headers.insert(std::move(std::make_pair(i.key().toString(), arr[j].toString())));
+                            }
+                        } else {
+                            res.headers.insert(std::move(std::make_pair(i.key().toString(), i.value().toString())));
+                        }
+                    }
+                    for (auto i = res_session.begin(); i != res_session.end(); i++) {
+                        res.session.insert(std::move(std::make_pair(i.key().toString(), i.value().toString())));
+                    }
+
+
+
+                    res.content = std::move(php_res.get("content").toString());
+
+                    res.status = std::move(php_res.get("status")).toInt();
+                    return;
+                }
+            }}zend_catch{
+            res.content = std::move(fmt::format("<p style='text-align:center;margin:100px;'>{}</p>", "PHP Throw Exception"));
+            res.status = 500;}zend_end_try();
+    }
 }

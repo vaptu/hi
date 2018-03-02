@@ -140,7 +140,7 @@ ngx_http_header_t  ngx_http_headers_in[] = {
                  offsetof(ngx_http_headers_in_t, upgrade),
                  ngx_http_process_header_line },
 
-#if (NGX_HTTP_GZIP)
+#if (NGX_HTTP_GZIP || NGX_HTTP_HEADERS)
     { ngx_string("Accept-Encoding"),
                  offsetof(ngx_http_headers_in_t, accept_encoding),
                  ngx_http_process_header_line },
@@ -555,6 +555,14 @@ ngx_http_create_request(ngx_connection_t *c)
     r->header_in = hc->busy ? hc->busy->buf : c->buffer;
 
     if (ngx_list_init(&r->headers_out.headers, r->pool, 20,
+                      sizeof(ngx_table_elt_t))
+        != NGX_OK)
+    {
+        ngx_destroy_pool(r->pool);
+        return NULL;
+    }
+
+    if (ngx_list_init(&r->headers_out.trailers, r->pool, 4,
                       sizeof(ngx_table_elt_t))
         != NGX_OK)
     {
@@ -1894,7 +1902,7 @@ ngx_http_process_request(ngx_http_request_t *r)
                               "client SSL certificate verify error: (%l:%s)",
                               rc, X509_verify_cert_error_string(rc));
 
-                ngx_ssl_remove_cached_session(sscf->ssl.ctx,
+                ngx_ssl_remove_cached_session(c->ssl->session_ctx,
                                        (SSL_get0_session(c->ssl->connection)));
 
                 ngx_http_finalize_request(r, NGX_HTTPS_CERT_ERROR);
@@ -1908,7 +1916,7 @@ ngx_http_process_request(ngx_http_request_t *r)
                     ngx_log_error(NGX_LOG_INFO, c->log, 0,
                                   "client sent no required SSL certificate");
 
-                    ngx_ssl_remove_cached_session(sscf->ssl.ctx,
+                    ngx_ssl_remove_cached_session(c->ssl->session_ctx,
                                        (SSL_get0_session(c->ssl->connection)));
 
                     ngx_http_finalize_request(r, NGX_HTTPS_NO_CERT);
@@ -2216,6 +2224,13 @@ ngx_http_request_handler(ngx_event_t *ev)
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "http run request: \"%V?%V\"", &r->uri, &r->args);
+
+    if (c->close) {
+        r->main->count++;
+        ngx_http_terminate_request(r, 0);
+        ngx_http_run_posted_requests(c);
+        return;
+    }
 
     if (ev->delayed && ev->timedout) {
         ev->delayed = 0;
